@@ -1,0 +1,233 @@
+name: zen-gateway-warp
+
+# Cloudflare WARP 节点模板：
+#   利用 Cloudflare WARP 双栈 TUN 虚拟网卡为网关提供 Anycast 出口，彻底规避机房 IP 拒连。
+#   4 小时软交班 + 硬超时兜底 + 429 秒级换 IP 自愈。
+#   网关直接复用预编译二进制（bin/zen-direct）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_run_sec:
+        description: "本次运行时长上限（秒），调试用；默认 3h50m 主动交班"
+        required: false
+        default: "13800"
+  schedule:
+    - cron: "*/20 * * * *"
+
+permissions:
+  contents: read
+  actions: write # 需要它来 dispatch 下一次运行
+
+concurrency:
+  group: zen-gateway
+  cancel-in-progress: false # 让新 run 排队，等旧 run 自己退场
+
+env:
+  PORT: "8081"
+  PROBE_MODEL: deepseek-v4.1-flash-free
+  PROBE_INTERVAL_SEC: "300"
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout (预编译二进制在这里)
+        uses: actions/checkout@v4
+
+      - name: Prune old runs (keep 3)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          repo="${{ github.repository }}"
+          keep=3
+          echo "只保留最近 $keep 条已完成的 run，更早的删除"
+          gh api "repos/$repo/actions/workflows/gateway.yml/runs?per_page=100" \
+            --jq '[.workflow_runs[] | select(.status == "completed")] | sort_by(.created_at) | reverse | .[3:] | .[].id' \
+          | while read -r id; do
+              [ -n "$id" ] || continue
+              [ "$id" = "${{ github.run_id }}" ] && continue
+              if gh api -X DELETE "repos/$repo/actions/runs/$id" >/dev/null 2>&1; then
+                echo "deleted run $id"
+              else
+                echo "skip run $id (delete failed)"
+              fi
+            done
+
+      - name: Check binary
+        run: |
+          set -euo pipefail
+          chmod +x bin/zen-direct
+          ls -l bin/zen-direct
+          sha256sum bin/zen-direct
+          rc=0
+          ZEN_PROBE_BODY=/nonexistent/zen-probe bin/zen-direct >/dev/null 2>&1 || rc=$?
+          if [ "$rc" != "2" ]; then
+            echo "::error::bin/zen-direct 跑不起来（rc=$rc）"
+            exit 1
+          fi
+
+      - name: Cache cloudflare-warp package
+        id: cache-warp-deb
+        uses: actions/cache@v4
+        with:
+          path: .cache/cloudflare-warp.deb
+          key: cloudflare-warp-deb-2026.8.2115.0
+
+      - name: Setup WARP (只提取 CLI/SVC，跳过 GUI 依赖)
+        run: |
+          set -euo pipefail
+          mkdir -p .cache
+          deb=.cache/cloudflare-warp.deb
+          if [ ! -s "$deb" ] || ! dpkg-deb --info "$deb" >/dev/null 2>&1; then
+            echo "下载 cloudflare-warp 官方包..."
+            curl -fsSL --retry 3 --retry-delay 1 \
+              -o "$deb" \
+              https://pkg.cloudflareclient.com/pool/noble/main/c/cloudflare-warp/cloudflare-warp_2026.8.2115.0_amd64.deb
+          fi
+
+          # warp-svc 只需要这些运行库，不装 webkit/gtk GUI 依赖。
+          deps=(
+            libdbus-1-3 libnss3 libpcap0.8
+            libtss2-esys-3.0.2-0t64 libtss2-tctildr0t64
+            iproute2 nftables libcap2-bin ca-certificates
+          )
+          if ! sudo apt-get install -y --no-install-recommends "${deps[@]}"; then
+            echo "依赖索引可能过期，刷新后重试..."
+            sudo apt-get -o Acquire::Retries=3 update -y
+            sudo apt-get install -y --no-install-recommends "${deps[@]}"
+          fi
+
+          rm -rf /tmp/warp-extract
+          mkdir -p /tmp/warp-extract
+          dpkg-deb --fsys-tarfile "$deb" \
+            | tar -x -C /tmp/warp-extract \
+                ./bin/warp-svc ./bin/warp-cli ./lib/systemd/system/warp-svc.service
+
+          sudo install -m 0755 /tmp/warp-extract/bin/warp-svc /usr/bin/warp-svc
+          sudo install -m 0755 /tmp/warp-extract/bin/warp-cli /usr/bin/warp-cli
+          sudo install -m 0644 /tmp/warp-extract/lib/systemd/system/warp-svc.service \
+            /etc/systemd/system/warp-svc.service
+          sudo systemctl daemon-reload
+          sudo systemctl enable warp-svc >/dev/null 2>&1 || true
+          sudo systemctl restart warp-svc
+
+          # 等 daemon socket 真正可用；systemctl is-active 不够，socket 可能还没建好。
+          ready=0
+          for i in $(seq 1 60); do
+            if sudo warp-cli --accept-tos status >/dev/null 2>&1; then ready=1; break; fi
+            sleep 0.25
+          done
+          if [ "$ready" != "1" ]; then
+            echo "::error::cloudflare-warp daemon 未就绪"
+            sudo systemctl status warp-svc --no-pager || true
+            sudo journalctl -u warp-svc -n 80 --no-pager || true
+            exit 1
+          fi
+
+          retry() {
+            local n=0
+            until "$@"; do
+              n=$((n + 1))
+              if [ "$n" -ge 4 ]; then return 1; fi
+              sleep 1
+            done
+          }
+          retry sudo warp-cli --accept-tos registration new
+          retry sudo warp-cli --accept-tos mode warp+doh
+          retry sudo warp-cli --accept-tos connect
+
+          # connect 是异步的，必须等到真正 Connected 再做 DNS/网关。
+          connected=0
+          for i in $(seq 1 60); do
+            st="$(sudo warp-cli --accept-tos status 2>&1 || true)"
+            if printf '%s' "$st" | grep -qE 'Status update: Connected|warp=on'; then
+              connected=1
+              break
+            fi
+            sleep 0.5
+          done
+          if [ "$connected" != "1" ]; then
+            echo "::error::WARP 30s 内未连接"
+            sudo warp-cli --accept-tos status || true
+            sudo journalctl -u warp-svc -n 80 --no-pager || true
+            exit 1
+          fi
+          echo "WARP 已连接（提取模式，跳过 GUI 依赖）"
+
+      - name: Fix DNS & Network Tuning (BBR + 双栈 DNS)
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo systemctl disable systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          sudo tee /etc/resolv.conf >/dev/null <<'EOF'
+          nameserver 1.1.1.1
+          nameserver 2606:4700:4700::1111
+          nameserver 8.8.8.8
+          nameserver 1.0.0.1
+          EOF
+          sudo sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_fastopen=3 2>/dev/null || true
+
+      - name: Cache cloudflared binary
+        id: cache-cloudflared
+        uses: actions/cache@v4
+        with:
+          path: bin/cloudflared
+          key: cloudflared-linux-amd64-v1
+
+      - name: Install cloudflared
+        if: steps.cache-cloudflared.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 2 \
+            -o bin/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x bin/cloudflared
+          bin/cloudflared --version
+
+      - name: Serve, tunnel, keepalive
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          ZEN_PUBLIC_HOST: ${{ vars.ZEN_PUBLIC_HOST }}
+          MAX_RUN_SEC: ${{ inputs.max_run_sec || '13800' }}
+          PROXY_URL: ${{ vars.PROXY_URL }}
+        run: bash scripts/run-gateway.sh
+
+      - name: Handoff and summary
+        if: always() && !cancelled()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          reason="$(cat run/rotate.flag 2>/dev/null || echo '退出但没留原因（被硬超时或异常杀掉）')"
+          {
+            echo "### zen-gateway-warp"
+            echo ""
+            echo "- 模板类型：\`Cloudflare WARP (Dual-Stack TUN)\`"
+            echo "- 交班原因：\`$reason\`"
+            echo "- 本次时长：$(cat run/uptime.txt 2>/dev/null || echo '?')"
+            echo "- 出口 IPv4：$(cat run/egress-ip.txt 2>/dev/null || echo '?')"
+            echo "- 公开地址：$(cat run/public-url.txt 2>/dev/null || echo '?')"
+            echo "- 探测统计：$(cat run/probe-stats.txt 2>/dev/null || echo '?')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f run/no-handoff ]; then
+            echo "::error::配置错误，已停止交班；修好后手动 Run workflow"
+            exit 0
+          fi
+
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/workflows/gateway.yml/dispatches" \
+            -d "{\"ref\":\"${GITHUB_REF_NAME:-main}\"}" || echo 000)"
+          echo "dispatch next run -> HTTP $code"
+          if [ "$code" != "204" ]; then
+            echo "::warning::下一次运行没派出去（HTTP $code），靠 cron 补位"
+          fi
