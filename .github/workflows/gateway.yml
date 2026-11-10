@@ -2,16 +2,16 @@ name: zen-gateway-warp
 
 # Cloudflare WARP 节点模板：
 #   利用 Cloudflare WARP 双栈 TUN 虚拟网卡为网关提供 Anycast 出口，彻底规避机房 IP 拒连。
-#   4 小时软交班 + 硬超时兜底 + 429 秒级换 IP 自愈。
+#   3 小时软交班 + 硬超时兜底 + 429 秒级换 IP 自愈。
 #   网关直接复用预编译二进制（bin/zen-direct）。
 
 on:
   workflow_dispatch:
     inputs:
       max_run_sec:
-        description: "本次运行时长上限（秒），调试用；默认 3h50m 主动交班"
+        description: "本次运行时长上限（秒），调试用；默认 3h 主动交班"
         required: false
-        default: "13800"
+        default: "10800"
   schedule:
     - cron: "*/20 * * * *"
 
@@ -31,7 +31,7 @@ env:
 jobs:
   serve:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 210
 
     steps:
       - name: Checkout (预编译二进制在这里)
@@ -119,7 +119,7 @@ jobs:
           # 等 daemon socket 真正可用；systemctl is-active 不够，socket 可能还没建好。
           ready=0
           for i in $(seq 1 60); do
-            if sudo warp-cli --accept-tos status >/dev/null 2>&1; then ready=1; break; fi
+            if timeout 2 sudo warp-cli --accept-tos status >/dev/null 2>&1; then ready=1; break; fi
             sleep 0.25
           done
           if [ "$ready" != "1" ]; then
@@ -137,14 +137,14 @@ jobs:
               sleep 1
             done
           }
-          retry sudo warp-cli --accept-tos registration new
-          retry sudo warp-cli --accept-tos mode warp+doh
-          retry sudo warp-cli --accept-tos connect
+          retry timeout 30 sudo warp-cli --accept-tos registration new
+          retry timeout 30 sudo warp-cli --accept-tos mode warp+doh
+          retry timeout 30 sudo warp-cli --accept-tos connect
 
           # connect 是异步的，必须等到真正 Connected 再做 DNS/网关。
           connected=0
           for i in $(seq 1 60); do
-            st="$(sudo warp-cli --accept-tos status 2>&1 || true)"
+            st="$(timeout 2 sudo warp-cli --accept-tos status 2>&1 || true)"
             if printf '%s' "$st" | grep -qE 'Status update: Connected|warp=on'; then
               connected=1
               break
@@ -152,8 +152,8 @@ jobs:
             sleep 0.5
           done
           if [ "$connected" != "1" ]; then
-            echo "::error::WARP 30s 内未连接"
-            sudo warp-cli --accept-tos status || true
+            echo "::error::WARP 未在限定时间内连接"
+            timeout 10 sudo warp-cli --accept-tos status || true
             sudo journalctl -u warp-svc -n 80 --no-pager || true
             exit 1
           fi
@@ -195,7 +195,7 @@ jobs:
         env:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
           ZEN_PUBLIC_HOST: ${{ vars.ZEN_PUBLIC_HOST }}
-          MAX_RUN_SEC: ${{ inputs.max_run_sec || '13800' }}
+          MAX_RUN_SEC: ${{ inputs.max_run_sec || '10800' }}
           PROXY_URL: ${{ vars.PROXY_URL }}
         run: bash scripts/run-gateway.sh
 
@@ -214,6 +214,7 @@ jobs:
             echo "- 出口 IPv4：$(cat run/egress-ip.txt 2>/dev/null || echo '?')"
             echo "- 公开地址：$(cat run/public-url.txt 2>/dev/null || echo '?')"
             echo "- 探测统计：$(cat run/probe-stats.txt 2>/dev/null || echo '?')"
+            echo "- 隧道观测：$(cat run/tunnel-stats.txt 2>/dev/null || echo '?')"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ -f run/no-handoff ]; then
