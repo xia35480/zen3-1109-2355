@@ -200,6 +200,7 @@ start_gateway() {
   ZEN_TLS=bun \
   ZEN_RUN_ID="${GITHUB_RUN_ID:-}" \
   DIRECT_SIDECAR=off \
+  ZEN_TOOL_CHANNEL=1 \
   "$BIN/zen-direct" >>"$GW_STDIO" 2>&1 &
   GW_PID=$!
   say "gateway pid=$GW_PID port=$PORT model=$PROBE_MODEL"
